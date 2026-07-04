@@ -75,6 +75,63 @@
   cursor: not-allowed;
 }
 
+#bbtools-panel .bbtools-focus-warning {
+  display: none; /* only shown while an upload is running */
+  margin: 4px 0 10px;
+  padding: 12px;
+  border-radius: 8px;
+  background: #fff3cd;
+  border: 2px solid #f0ad4e;
+  color: #7a5b00;
+  font-size: 15px;
+  font-weight: 800;
+  line-height: 1.3;
+  text-align: center;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+#bbtools-panel .bbtools-focus-warning span {
+  display: block;
+  margin-top: 6px;
+  font-size: 11.5px;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0;
+  color: #8a6d1a;
+}
+
+#bbtools-panel.bbtools-uploading .bbtools-focus-warning {
+  display: block;
+}
+
+/* When the upload is paused because the window lost focus, make it unmissable. */
+#bbtools-panel.bbtools-paused {
+  border-color: #e0a800;
+  box-shadow: 0 0 0 3px #ffd24d, 0 6px 24px rgba(0, 0, 0, 0.25);
+}
+
+#bbtools-panel.bbtools-paused .bbtools-focus-warning {
+  background: #ffe08a;
+  border-color: #e0a800;
+  animation: bbtools-blink 1s steps(2, start) infinite;
+}
+
+#bbtools-panel.bbtools-paused .bbtools-focus-warning::before {
+  content: "⏸ PAUSED — click here to resume";
+  white-space: normal;
+  overflow-wrap: break-word;
+  display: block;
+  margin-bottom: 6px;
+  color: #a10000;
+}
+
+@keyframes bbtools-blink {
+  50% {
+    opacity: 0.55;
+  }
+}
+
 #bbtools-panel .bbtools-status {
   margin-top: 10px;
   font-size: 11.5px;

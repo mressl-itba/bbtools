@@ -102,6 +102,36 @@
     }
   }
 
+  // Grades only persist to the server while the window has OS focus (Blackboard
+  // ignores our edits otherwise). So before any grade write we GATE on focus:
+  // if the window isn't focused, pause and wait until it is again. This makes the
+  // import safe to leave running as long as the window stays focused — the moment
+  // you click away it pauses, and it resumes when you come back.
+  async function ensureFocused() {
+    if (document.hasFocus()) return;
+    log("⏸ PAUSED — click back on this window to resume (grades need focus).");
+    setPaused(true);
+    for (;;) {
+      if (document.hasFocus()) break;
+      await sleep(200);
+    }
+    setPaused(false);
+    log("▶ Resumed.");
+  }
+
+  // Toggle the panel's "paused / lost focus" visual state.
+  function setPaused(on) {
+    const panel = document.getElementById("bbtools-panel");
+    if (panel) panel.classList.toggle("bbtools-paused", !!on);
+  }
+
+  // Toggle the panel's "upload in progress" state (shows the focus warning only
+  // while an import is actually running).
+  function setUploading(on) {
+    const panel = document.getElementById("bbtools-panel");
+    if (panel) panel.classList.toggle("bbtools-uploading", !!on);
+  }
+
   /* ---------------------------------------------------------------------------
    * "HUMAN-LIKE" TYPING
    *
@@ -112,6 +142,14 @@
    * ------------------------------------------------------------------------- */
   async function typeLikeHuman(el, text) {
     if (!el) return false;
+    // Release focus from any previously-focused editor (e.g. an unsaved comment
+    // Quill editor) so it can't trap focus and block this pill's blur/autosave.
+    const prev = document.activeElement;
+    if (prev && prev !== el && typeof prev.blur === "function") {
+      try {
+        prev.blur();
+      } catch (_) {}
+    }
     el.click(); // enter edit mode (pill input is readonly otherwise)
     await sleep(60);
     el.focus();
@@ -152,9 +190,68 @@
 
     el.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "a" }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
-    el.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
-    await sleep(120);
+    // We do NOT blur here. The MUI pill input only exposes the typed value in
+    // its `.value` WHILE it is in edit mode; if we blurred first, the readback
+    // in writeGrade would see an empty value and burn the full retry timeouts
+    // (~5 s). The caller (commitGrade) blurs once the value is verified, which
+    // is what actually triggers the autosave.
+    await sleep(30);
     return true;
+  }
+
+  // Blur the pill for REAL to trigger its autosave. A dispatched blur *event*
+  // alone does not remove focus (caret stays, next navigation blocked), so we
+  // must call el.blur().
+  async function commitGrade(el) {
+    // Blur to trigger the pill's autosave. This only persists while the window is
+    // focused (see ensureFocused), which the import gates on before every grade.
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    try {
+      el.blur();
+    } catch (_) {}
+    el.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
+    // If focus didn't actually leave, force whatever is still focused to blur.
+    const ae = document.activeElement;
+    if (ae && typeof ae.blur === "function") {
+      try {
+        ae.blur();
+      } catch (_) {}
+    }
+    await sleep(120);
+  }
+
+  // Compare two grade strings numerically ("8" == "8.0" == "8,0").
+  function sameNumber(a, b) {
+    const na = parseFloat(String(a).replace(",", "."));
+    const nb = parseFloat(String(b).replace(",", "."));
+    if (!isNaN(na) && !isNaN(nb)) return na === nb;
+    return String(a).trim() === String(b).trim();
+  }
+
+  // Write a grade and VERIFY it stuck: after typing, wait for the value to settle
+  // (the pill autosaves on blur; a slow save can otherwise be reverted by a later
+  // re-render), then read the input back. Retry a few times. Returns { ok, got }.
+  async function writeGrade(input, grade) {
+    const target = String(grade).trim();
+    let got = "";
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await typeLikeHuman(input, target);
+      // Verify WHILE the input is still focused (edit mode): the value is there
+      // immediately, so this matches on the first poll. Reading after the blur
+      // is unreliable — the pill clears `.value` out of edit mode — which is
+      // what used to make this burn ~5 s of timeouts.
+      await waitFor(() => sameNumber(readValue(input), target), {
+        timeout: 600,
+        interval: 60,
+      });
+      got = readValue(input).trim();
+      if (sameNumber(got, target)) {
+        await commitGrade(input); // blur -> autosave
+        return { ok: true, got, attempts: attempt };
+      }
+    }
+    await commitGrade(input); // don't leave the pill stuck in edit mode
+    return { ok: false, got, attempts: 3 };
   }
 
   // Bullet marker at the start of a line: "- ", "* " or "• ".
@@ -212,6 +309,56 @@
       }
     }
     return parts.join("") || "<p><br></p>";
+  }
+
+  // Build a Quill Delta (ops array) from the comment text: bullet lines become
+  // list items, the rest plain paragraphs. This is what we hand to the MAIN-world
+  // script to apply via Quill's API with source "user" (see setCommentViaPage).
+  function commentToDelta(text) {
+    const lines = String(text).split(/\r?\n/);
+    const ops = [];
+    for (const line of lines) {
+      const m = RE_BULLET.exec(line);
+      if (m) {
+        ops.push({ insert: m[2] });
+        ops.push({ insert: "\n", attributes: { list: "bullet" } });
+      } else {
+        ops.push({ insert: line });
+        ops.push({ insert: "\n" });
+      }
+    }
+    if (ops.length === 0) ops.push({ insert: "\n" });
+    return ops;
+  }
+
+  // Ask the MAIN-world helper (main_world.js) to set the comment via Quill's own
+  // API with source "user" — the only reliable way to make Blackboard mark the
+  // field as edited and enable "Guardar". Returns { ok, err }. The isolated world
+  // can't reach the Quill instance itself, hence the postMessage bridge.
+  function setCommentViaPage(regionId, ops, timeout = 3000) {
+    return new Promise((resolve) => {
+      const id = "bbt" + Date.now() + "_" + Math.floor(Math.random() * 1e6);
+      let done = false;
+      const onMsg = (ev) => {
+        if (ev.source !== window) return;
+        const m = ev.data;
+        if (!m || m.type !== "BBTOOLS_SET_COMMENT_RESULT" || m.id !== id) return;
+        done = true;
+        window.removeEventListener("message", onMsg);
+        resolve(m);
+      };
+      window.addEventListener("message", onMsg);
+      window.postMessage(
+        { type: "BBTOOLS_SET_COMMENT", id, regionId, ops },
+        "*"
+      );
+      setTimeout(() => {
+        if (!done) {
+          window.removeEventListener("message", onMsg);
+          resolve({ ok: false, err: "timeout (no MAIN-world reply)" });
+        }
+      }, timeout);
+    });
   }
 
   // Paste the comment into the comment editor (Quill: div.ql-editor
@@ -532,16 +679,208 @@
     return f;
   }
 
-  async function selectStudent(studentEl) {
-    // Look for a clickable element (the item itself or a button/link inside).
+  // Dispatch a full pointer/mouse sequence (some React menu items react to
+  // mousedown/pointerdown, not just a bare click()).
+  function realClick(el) {
+    if (!el) return;
+    const o = { bubbles: true, cancelable: true, view: window };
+    for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+      try {
+        el.dispatchEvent(
+          type.startsWith("pointer")
+            ? new PointerEvent(type, o)
+            : new MouseEvent(type, o)
+        );
+      } catch (_) {
+        try {
+          el.dispatchEvent(new MouseEvent(type.replace("pointer", "mouse"), o));
+        } catch (_2) {}
+      }
+    }
+    if (typeof el.click === "function") {
+      try {
+        el.click();
+      } catch (_) {}
+    }
+  }
+
+  function headerStudentName() {
+    const h = document.querySelector('h1[data-testid="user-name"]');
+    return h ? norm(h.textContent) : "";
+  }
+
+  // Header prev/next student navigation (NOT virtualized — always present).
+  const NAV_NEXT = '[data-analytics-id="attemptGrading.studentNavigation.nextStudent"]';
+  const NAV_PREV = '[data-analytics-id="attemptGrading.studentNavigation.previousStudent"]';
+
+  function isNavDisabled(el) {
+    return (
+      !el ||
+      el.getAttribute("aria-disabled") === "true" ||
+      el.hasAttribute("disabled") ||
+      el.disabled === true
+    );
+  }
+
+  // Current student shown in the header: name + legajo (read from the header,
+  // which reflects the selected student regardless of the list's virtualization).
+  function currentHeaderStudent() {
+    const h1 = document.querySelector('h1[data-testid="user-name"]');
+    if (!h1) return { name: "", id: "" };
+    let c = h1;
+    let id = "";
+    for (let k = 0; k < 6 && c; k++) {
+      id = readStudentId(c);
+      if (id) break;
+      c = c.parentElement;
+    }
+    return { name: norm(h1.textContent), id };
+  }
+
+  // Walk to the first student (click "previous" until it's disabled).
+  async function goToFirstStudent() {
+    for (let i = 0; i < 1000; i++) {
+      const btn = document.querySelector(NAV_PREV);
+      if (isNavDisabled(btn)) return;
+      const before = headerStudentName();
+      realClick(btn);
+      const ok = await waitFor(() => headerStudentName() !== before, { timeout: 6000 });
+      await sleep(150);
+      if (!ok) return; // couldn't move — stop trying
+    }
+  }
+
+  // Go to the next student. Returns false if already at the last one.
+  async function goToNextStudent() {
+    const btn = document.querySelector(NAV_NEXT);
+    if (isNavDisabled(btn)) return false;
+    const before = headerStudentName();
+    realClick(btn);
+    await waitFor(() => headerStudentName() !== before, { timeout: 8000 });
+    await sleep(PAUSE);
+    return true;
+  }
+
+  // Find the scrollable ancestor of the student list (the side panel is
+  // lazy-loaded: only ~15 items mount until you scroll).
+  function findStudentScroller() {
+    const first = document.querySelector(SEL.studentListItem);
+    let el = first ? first.parentElement : null;
+    while (el && el !== document.body) {
+      const oy = getComputedStyle(el).overflowY;
+      if (/(auto|scroll)/.test(oy) && el.scrollHeight > el.clientHeight + 20) {
+        return el;
+      }
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  // Scroll the student list until its item count stops growing, so every student
+  // mounts. Then scroll back to the top. Returns the final count.
+  async function loadAllStudents() {
+    const scroller = findStudentScroller();
+    let prev = -1;
+    let stable = 0;
+    for (let i = 0; i < 80 && stable < 2; i++) {
+      const count = document.querySelectorAll(SEL.studentListItem).length;
+      if (count === prev) stable++;
+      else stable = 0;
+      prev = count;
+
+      const items = document.querySelectorAll(SEL.studentListItem);
+      const last = items[items.length - 1];
+      if (last) last.scrollIntoView({ block: "end" });
+      if (scroller) scroller.scrollTop = scroller.scrollHeight;
+      await sleep(400);
+    }
+    if (scroller) scroller.scrollTop = 0;
+    await sleep(300);
+    const total = document.querySelectorAll(SEL.studentListItem).length;
+    log(`${total} students loaded.`);
+    return total;
+  }
+
+  async function selectStudent(studentEl, expectedName) {
+    // Remove focus from any field still in edit mode (e.g. a grade pill) — the
+    // navigation click can be swallowed otherwise.
+    if (document.activeElement && document.activeElement.blur) {
+      try {
+        document.activeElement.blur();
+      } catch (_) {}
+    }
+
+    const before = headerStudentName();
     const clickable =
       studentEl.querySelector('a, button, [role="button"], [role="option"]') ||
       studentEl;
-    clickable.click();
+    const want = norm(expectedName || "").toLowerCase();
+
+    // "Navigated" = this student's item is now current, or the header shows them.
+    // NOTE: do NOT use getQuestions().length here — questions from the PREVIOUS
+    // student are still on screen, so it would report success without navigating.
+    const confirmed = () => {
+      if (studentEl.getAttribute && studentEl.getAttribute("aria-current") === "page")
+        return true;
+      if (want && headerStudentName().toLowerCase() === want) return true;
+      return false;
+    };
+
+    // Click and confirm navigation; retry a few times if the first click gets
+    // swallowed (e.g. by a transient post-write state).
+    let navigated = confirmed();
+    for (let attempt = 1; attempt <= 4 && !navigated; attempt++) {
+      realClick(clickable);
+      navigated = await waitFor(confirmed, { timeout: 3000 });
+      if (!navigated) {
+        log(
+          `  selectStudent: attempt ${attempt} not confirmed (wanted "${expectedName}", header "${headerStudentName()}").`
+        );
+      }
+    }
     await sleep(PAUSE);
-    // Wait for the questions to render (or time out -> treat as no submission).
-    await waitFor(() => getQuestions().length > 0, { timeout: 8000 });
-    await sleep(PAUSE);
+    // Blackboard lazy-loads questions on scroll: force them all to mount.
+    await loadAllQuestions();
+  }
+
+  // Find the scrollable ancestor that holds the question list.
+  function findQuestionScroller() {
+    const first = document.querySelector(SEL.questionNumber);
+    let el = first ? first.parentElement : null;
+    while (el && el !== document.body) {
+      const oy = getComputedStyle(el).overflowY;
+      if (/(auto|scroll)/.test(oy) && el.scrollHeight > el.clientHeight + 20) {
+        return el;
+      }
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  // Scroll down in steps until the question count stops growing, so that
+  // lazily-loaded questions all mount. Then scroll back to the top.
+  async function loadAllQuestions() {
+    const scroller = findQuestionScroller();
+    let prev = -1;
+    let stable = 0;
+    for (let i = 0; i < 40 && stable < 2; i++) {
+      const count = document.querySelectorAll(SEL.questionNumber).length;
+      if (count === prev) stable++;
+      else stable = 0;
+      prev = count;
+
+      // Nudge the last question into view + push the scroller to the bottom.
+      const nums = document.querySelectorAll(SEL.questionNumber);
+      const last = nums[nums.length - 1];
+      if (last) last.scrollIntoView({ block: "end" });
+      if (scroller) scroller.scrollTop = scroller.scrollHeight;
+      window.scrollTo(0, document.body.scrollHeight);
+      await sleep(450);
+    }
+    if (scroller) scroller.scrollTop = 0;
+    window.scrollTo(0, 0);
+    await sleep(300);
+    log(`  ${document.querySelectorAll(SEL.questionNumber).length} questions loaded.`);
   }
 
   /* ---------------------------------------------------------------------------
@@ -745,20 +1084,25 @@
   async function exportExam(btn) {
     btn.disabled = true;
     try {
-      const items = getStudents();
-      if (items.length === 0) {
-        log(
-          'Could not locate the student side panel ([data-testid="user-name"]). Check the SEL object (see README).'
-        );
+      if (!document.querySelector('h1[data-testid="user-name"]')) {
+        log("Student header not found. Open a student's grading view first.");
         return;
       }
-      log(`Found ${items.length} students in the side panel.`);
-      const result = [];
 
-      for (let i = 0; i < items.length; i++) {
-        const item = items[i];
-        log(`(${i + 1}/${items.length}) ${item.name}...`);
-        await selectStudent(item.el);
+      // Walk students via the header "next" navigation (the side list is
+      // virtualized — only ~15 items ever mount — so we don't rely on it).
+      await goToFirstStudent();
+      const result = [];
+      const seen = new Set();
+      let guard = 0;
+      do {
+        const stu = currentHeaderStudent();
+        const key = (stu.id || stu.name || "").toLowerCase();
+        if (key && seen.has(key)) break; // safety: looped back
+        if (key) seen.add(key);
+
+        log(`(${result.length + 1}) ${stu.name}${stu.id ? ` (${stu.id})` : ""}...`);
+        await loadAllQuestions();
 
         const questions = [];
         const live = getQuestions();
@@ -773,19 +1117,16 @@
             questions.push(content);
           }
         } else {
-          log(`  ${item.name}: no submission, skipped.`);
+          log(`  ${stu.name}: no submission.`);
         }
-        result.push({
-          name: item.name,
-          id: item.id,
-          noSubmission,
-          questions,
-        });
-      }
+        result.push({ name: stu.name, id: stu.id, noSubmission, questions });
+        guard++;
+      } while (guard < 1000 && (await goToNextStudent()));
 
       const txt = serialize(result);
-      const filename = `exam_export_${stamp()}.md`;
+      const filename = `${sanitizeFilename(getExamTitle())}_${stamp()}.md`;
       triggerDownload(txt, filename);
+      log(`Exported ${result.length} students.`);
     } catch (e) {
       log("Export error: " + (e && e.message));
       console.error(e);
@@ -800,6 +1141,16 @@
     return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(
       d.getHours()
     )}${p(d.getMinutes())}`;
+  }
+
+  // Strip characters that are invalid in file names (Windows/macOS/Linux).
+  function sanitizeFilename(s) {
+    return (
+      String(s || "")
+        .replace(/[\\/:*?"<>|]+/g, "")
+        .replace(/\s+/g, " ")
+        .trim() || "exam"
+    );
   }
 
   // Download the file. Primary path: chrome.downloads via the background worker,
@@ -866,65 +1217,122 @@
    * FEATURE 2 — IMPORT
    * ------------------------------------------------------------------------- */
   async function importGrades(fileStudents) {
-    const items = getStudents();
-    if (items.length === 0) {
-      log("Could not locate the student side panel (import).");
+    if (!document.querySelector('h1[data-testid="user-name"]')) {
+      log("Student header not found. Open a student's grading view first.");
       return;
     }
 
-    // Index live students by name (normalized) and by id.
-    const byName = new Map();
+    // Index the file's students by legajo (primary) and name (fallback).
     const byId = new Map();
-    items.forEach((it) => {
-      if (it.name) byName.set(it.name.toLowerCase(), it);
-      if (it.id) byId.set(it.id.toLowerCase(), it);
+    const byName = new Map();
+    fileStudents.forEach((fs) => {
+      if (fs.id) byId.set(fs.id.toLowerCase(), fs);
+      if (fs.name) byName.set(fs.name.toLowerCase(), fs);
     });
 
-    for (let i = 0; i < fileStudents.length; i++) {
-      const fs = fileStudents[i];
-      // Match by ID first (disambiguates same-name students), then by name.
-      const match =
-        (fs.id && byId.get(fs.id.toLowerCase())) ||
-        (fs.name && byName.get(fs.name.toLowerCase()));
-      if (!match) {
-        log(`Student "${fs.name}" (${fs.id}) not found in the list. Skipping.`);
-        continue;
+    // Walk ALL students via the header "next" navigation (the side list is
+    // virtualized), applying grades/comments to the ones present in the file.
+    await goToFirstStudent();
+    const seen = new Set();
+    let processed = 0;
+    let guard = 0;
+    do {
+      const stu = currentHeaderStudent();
+      const navKey = (stu.id || stu.name || "").toLowerCase();
+      if (navKey && seen.has(navKey)) break; // safety: looped back
+      if (navKey) seen.add(navKey);
+
+      const fs =
+        (stu.id && byId.get(stu.id.toLowerCase())) ||
+        (stu.name && byName.get(stu.name.toLowerCase()));
+      if (fs) {
+        log(`Loading ${stu.name}${stu.id ? ` (${stu.id})` : ""}...`);
+        await loadAllQuestions();
+        await applyStudent(fs);
+        processed++;
       }
-      log(`(${i + 1}/${fileStudents.length}) Loading ${fs.name}...`);
-      await selectStudent(match.el);
+      guard++;
+    } while (guard < 1000 && (await goToNextStudent()));
 
-      // Live questions, keyed the same way as the file (content id, else visual).
-      const live = getQuestions();
-      if (live.length === 0) {
-        log(`  ${fs.name}: no submission, skipped.`);
-        continue;
-      }
-      const byKey = new Map();
-      live.forEach((lq) => byKey.set(qKey(lq), lq));
+    log(
+      `Import finished: ${processed} students updated. 'Publish grades' NOT clicked.`
+    );
+  }
 
-      for (const fq of fs.questions) {
-        const lq = byKey.get(fq.questionKey);
-        if (!lq) {
-          log(`  Question ${fq.questionKey}: not on screen, skipped.`);
-          continue;
-        }
+  // Apply one file student's grades + comments to the CURRENT screen.
+  // Interleaved: per question, grade then comment (the comment button ref is used
+  // fresh, right after its grade). A final verification pass rewrites any grade
+  // reverted by a comment "Save".
+  // Live questions keyed the same way as the file (content id, else visual).
+  function questionsByKey() {
+    const m = new Map();
+    getQuestions().forEach((lq) => m.set(qKey(lq), lq));
+    return m;
+  }
 
-        // 1) Grade (if the professor filled it in).
-        if (fq.grade !== "" && fq.grade != null) {
-          await typeLikeHuman(lq.gradeInput, fq.grade);
-          log(`  Q${lq.visual} (q${lq.questionId}): grade ${fq.grade} written.`);
-          await sleep(PAUSE);
-        }
-
-        // 2) Comment (if filled in).
-        if (fq.comment && fq.comment.trim() !== "") {
-          await loadComment(lq, fq.comment);
-          await sleep(PAUSE);
-        }
-      }
-      log(`  ${fs.name}: done. Review and save manually.`);
+  async function applyStudent(fs) {
+    let byKey = questionsByKey();
+    if (byKey.size === 0) {
+      log(`  no submission, skipped.`);
+      return;
     }
-    log("Import finished. Nothing was saved or published automatically.");
+
+    for (const fq of fs.questions) {
+      const hasGrade = fq.grade !== "" && fq.grade != null;
+      const hasComment = fq.comment && fq.comment.trim() !== "";
+      if (!hasGrade && !hasComment) continue;
+
+      const lq = byKey.get(fq.questionKey);
+      if (!lq) {
+        log(`  Question ${fq.questionKey}: not on screen, skipped.`);
+        continue;
+      }
+
+      // 1) Grade (write + verify + retry). Gate on focus: grades only persist to
+      // the server while the window is focused, so pause here if it isn't.
+      if (hasGrade) {
+        await ensureFocused();
+        const res = await writeGrade(lq.gradeInput, fq.grade);
+        log(
+          res.ok
+            ? `  Q${lq.visual}: grade ${fq.grade} set (readback ${res.got}).`
+            : `  Q${lq.visual}: grade ${fq.grade} did NOT stick (readback "${res.got}").`
+        );
+        // Short settle only: the pill needs to leave edit mode and re-render.
+        // No long blind wait here — the final verification pass below rewrites
+        // any grade a later comment "Save" reverts, so this doesn't need to be
+        // the safety margin.
+        await sleep(120);
+      }
+
+      // 2) Comment (paste + "Save").
+      if (hasComment) {
+        await loadComment(lq, fq.comment);
+        await sleep(150);
+      }
+    }
+
+    // Final verification: re-check grades, rewrite any reverted by a comment Save.
+    await sleep(400);
+    byKey = questionsByKey();
+    for (const fq of fs.questions) {
+      if (fq.grade === "" || fq.grade == null) continue;
+      const lq = byKey.get(fq.questionKey);
+      if (!lq || !lq.gradeInput) continue;
+      const cur = readValue(lq.gradeInput).trim();
+      if (!sameNumber(cur, fq.grade)) {
+        log(`  Q${lq.visual}: grade reverted (now "${cur}") — rewriting.`);
+        await ensureFocused();
+        const res = await writeGrade(lq.gradeInput, fq.grade);
+        log(
+          res.ok
+            ? `  Q${lq.visual}: grade re-set (${res.got}).`
+            : `  Q${lq.visual}: grade STILL not set ("${res.got}").`
+        );
+        await sleep(PAUSE);
+      }
+    }
+    await sleep(500);
   }
 
   async function loadComment(question, comment) {
@@ -934,10 +1342,10 @@
       return;
     }
     // Open the comment panel (only if it's currently collapsed — clicking an
-    // already-open one would close it).
+    // already-open one would close it). No fixed wait: the waitFor(findEditable)
+    // below polls until the editor mounts.
     if (btn.getAttribute("aria-expanded") !== "true") {
       btn.click();
-      await sleep(PAUSE);
     }
 
     // Scope the editor search to THIS question's feedback region, so we never
@@ -947,38 +1355,93 @@
       (btn.id || "").replace(/-button$/, "-region");
     const region = regionId ? document.getElementById(regionId) : null;
 
-    // Find the real editable. NOTE: the page has ~31 ".ql-clipboard" divs
-    // (Quill helpers, aria-hidden, tabindex=-1) that are also contenteditable —
-    // they must be excluded, along with the read-only editors.
-    const editable = await waitFor(() => {
+    // Find the real editable. NOTE: the page has many ".ql-clipboard" divs
+    // (Quill helpers) and read-only editors that must be excluded.
+    const findEditable = () => {
       const scope = region || document;
       return (
         Array.from(scope.querySelectorAll(SEL.contentEditable)).find((el) =>
           isValidCommentEditor(el)
         ) || null
       );
-    }, { timeout: 6000 });
+    };
+    // Short probe first. If the question already has feedback from a previous
+    // run, the region shows it READ-ONLY with an "Edit"/"Editar" button and NO
+    // editable — so instead of burning the full 4 s timeout waiting for an
+    // editable that isn't there, probe briefly and, if there's an Edit button,
+    // click it right away.
+    let editable = await waitFor(findEditable, { timeout: 800, interval: 60 });
+    if (!editable) {
+      const editBtn = findEditButton(region);
+      if (editBtn) editBtn.click();
+      editable = await waitFor(findEditable, { timeout: 4000, interval: 80 });
+    }
 
     if (!editable) {
-      log(`  Q${question.visual}: comment editor not found.`);
+      const total = region
+        ? region.querySelectorAll(SEL.contentEditable).length
+        : -1;
+      const ro = region
+        ? region.querySelectorAll(".is-read-only, .ql-disabled").length
+        : -1;
+      log(
+        `  Q${question.visual}: comment editor not found (region=${!!region}, contenteditable=${total}, readonly=${ro}, expanded=${btn.getAttribute(
+          "aria-expanded"
+        )}).`
+      );
       return;
     }
-    const ok = await pasteIntoEditor(editable, comment);
-    if (!ok) {
-      log(`  Q${question.visual}: editor found but comment insert failed.`);
-      return;
+    // Preferred path: set the comment through Quill's own API in the MAIN world
+    // (source "user"), which is what actually enables "Guardar". Fall back to the
+    // execCommand/paste path if the bridge can't reach a Quill instance.
+    let inserted = false;
+    if (regionId) {
+      const res = await setCommentViaPage(regionId, commentToDelta(comment));
+      if (res.ok) {
+        inserted = true;
+      } else {
+        log(`  Q${question.visual}: Quill bridge failed (${res.err}) — falling back.`);
+      }
+    }
+    if (!inserted) {
+      const ok = await pasteIntoEditor(editable, comment);
+      if (!ok) {
+        log(`  Q${question.visual}: editor found but comment insert failed.`);
+        return;
+      }
     }
 
     // Click "Save" so the comment PERSISTS. Without it, navigating to the next
     // student discards the draft. (This only saves the feedback; it never
-    // clicks "Publish grades".)
-    const saveBtn = findSaveButton(region);
+    // clicks "Publish grades".) The button can be briefly disabled right after
+    // the edit until it registers, so poll a moment for it.
+    const saveBtn = await waitFor(() => findSaveButton(region), {
+      timeout: 1500,
+      interval: 80,
+    });
     if (saveBtn) {
       saveBtn.click();
-      await sleep(PAUSE);
+      await sleep(150);
       log(`  Q${question.visual}: comment saved.`);
     } else {
-      log(`  Q${question.visual}: comment inserted but "Save" not found — NOT saved.`);
+      // Diagnose: is a "Guardar"/"Save" button present but disabled (the edit
+      // wasn't registered as a user change), or genuinely absent?
+      const scope = region || document;
+      const cands = Array.from(
+        scope.querySelectorAll('button, [role="button"]')
+      ).filter((b) => RE_SAVE.test(b.textContent || ""));
+      const desc =
+        cands
+          .map(
+            (b) =>
+              `disabled=${b.disabled}|aria=${b.getAttribute(
+                "aria-disabled"
+              )}|vis=${isVisible(b)}`
+          )
+          .join("; ") || "none in region";
+      log(
+        `  Q${question.visual}: comment inserted but "Save" not clicked — [${desc}] (hasFocus=${document.hasFocus()}).`
+      );
     }
   }
 
@@ -1001,6 +1464,21 @@
   // The "Save" button of the comment editor (Guardar / Save), searched inside the
   // question's feedback region first, then in the document. Must be enabled and
   // visible. This is NOT "Publish grades" — it only persists the feedback draft.
+  // The "Edit"/"Editar" button shown when a question already has (read-only)
+  // feedback from a previous run. Clicking it re-mounts the editable.
+  const RE_EDIT = /editar|edit/i;
+  function findEditButton(region) {
+    if (!region) return null;
+    return (
+      Array.from(region.querySelectorAll('button, [role="button"]')).find(
+        (b) =>
+          RE_EDIT.test(
+            (b.getAttribute("aria-label") || "") + " " + (b.textContent || "")
+          ) && isVisible(b)
+      ) || null
+    );
+  }
+
   const RE_SAVE = /^\s*(guardar|save)\s*$/i;
   function findSaveButton(scope) {
     for (const root of [scope, document]) {
@@ -1029,6 +1507,11 @@
         <button class="bbtools-min" id="bbtools-min" title="Minimize">–</button>
       </div>
       <div class="bbtools-body">
+        <div class="bbtools-focus-warning">
+          ⚠ KEEP THIS WINDOW FOCUSED<br />
+          <span>Grades are only saved while this window is in focus. If you
+          click away, the upload PAUSES and resumes when you return.</span>
+        </div>
         <button class="bbtools-btn" id="bbtools-export">Download responses</button>
         <button class="bbtools-btn secondary" id="bbtools-import">Upload grades/comments</button>
         <input type="file" id="bbtools-file-input" accept=".md,.txt,text/markdown,text/plain" />
@@ -1052,12 +1535,16 @@
       const text = await file.text();
       fileInput.value = ""; // allow re-selecting the same file
       try {
+        setUploading(true);
         const students = parse(text);
         log(`File parsed: ${students.length} students.`);
         await importGrades(students);
       } catch (err) {
         log("Import error: " + (err && err.message));
         console.error(err);
+      } finally {
+        setUploading(false);
+        setPaused(false);
       }
     });
 

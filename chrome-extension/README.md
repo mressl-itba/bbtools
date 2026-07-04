@@ -29,23 +29,42 @@ whatever language the exam is written in.
 
 ## Usage
 
-- **Download exam**: walks the student side panel, opens each one and, per
-  question, **expands the collapsible panel** (clicks the chevron) so the answer
-  mounts, then extracts the visual number, type, prompt, answer, current grade
-  and max points. **Auto-graded questions (multiple choice / multiple answer /
-  true-false) are excluded** — there's nothing to grade by hand. Downloads a
-  `.md` (Markdown) file with the remaining (manually-graded) questions to fill in
-  offline.
+- **Download exam**: walks the student side panel, opens each one, **scrolls to
+  force all lazily-loaded questions to mount**, and per question **expands the
+  collapsible panel** (clicks the chevron) so the answer mounts, then extracts
+  the visual number, type, prompt, answer, current grade and max points.
+  **Auto-graded questions (multiple choice / multiple answer / true-false) are
+  excluded**. Downloads a `.md` named `{exam title}_{YYYYMMDD_HHMM}.md`.
 - **Upload grades/comments**: opens a file picker. Choose the completed `.md`.
-  For each student/question it writes the grade into the pill input and inserts
-  the comment into the **Quill** editor (via `execCommand insertText`), then
-  clicks **"Save"** so the comment persists (without it, navigating to the next
-  student discards the draft). It **never** clicks **"Publish grades"** — that's
-  left for the professor to review and publish.
+  Per student, per question, interleaved: **(1)** write the grade into its pill
+  input (with read-back + retry), **(2)** set the comment in the **Quill** editor
+  and click **"Save"**. After each student a **final pass** re-reads the grades
+  and rewrites any that got reverted. It **never** clicks **"Publish grades"** —
+  that's left for the professor to review and publish.
 
-Actions are spaced ~400 ms apart to let React re-render. Students with no
-submission are detected and skipped. If a question ends up with **no grade and no
-comment**, nothing is touched for that question.
+> ⚠ **Keep the window focused while uploading.** Grades only persist to the
+> server while the browser window has OS focus (Blackboard ignores programmatic
+> edits otherwise). The upload **gates on focus**: if you click away it **pauses**
+> (the panel turns yellow and blinks "PAUSED") and **resumes** automatically when
+> the window regains focus. So it's safe to leave running — just don't take focus
+> away, or it will wait. Comments are not affected (see below).
+
+Students with no submission are detected and skipped. If a question ends up with
+**no grade and no comment**, nothing is touched for that question.
+
+### Why comments need a MAIN-world helper (`main_world.js`)
+
+Inserting a comment with `execCommand`/paste from the content script puts the
+text on screen but Blackboard does **not** mark the field as edited, so its
+**"Guardar"** button stays disabled and the comment is never saved — unless the
+edit comes from a *genuine* user interaction. To get a real "user" edit without
+depending on focus, `main_world.js` runs in the page's **MAIN world**, reaches
+the editor's own **Quill instance** (`ed.__quill`, invisible to the isolated
+content script), and applies the comment via `quill.setContents(delta, "user")`.
+That emits the `text-change` event Blackboard listens to, which enables "Guardar".
+It uses only the editor's public API — no REST API, no React state setters. The
+content script talks to it over `window.postMessage`. Grades have no equivalent
+JS API we can reach, which is why they fall back to the focus requirement above.
 
 > **Important — collapsible:** in this view each question is an accordion and the
 > **answer is unmounted from the DOM while collapsed**. That's why *export*
