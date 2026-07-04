@@ -11,7 +11,7 @@ Blackboard Ultra's exam editor is slow for bulk work: reviewing many questions, 
 | [qti2gift.py](qti2gift.py) | Converts a QTI 2.1 exam package (Blackboard Ultra export) to a Moodle GIFT text file |
 | [gift2qti.py](gift2qti.py) | Converts a GIFT file back to a QTI 2.1 `.zip` package importable into Blackboard Ultra |
 | [chrome-extension/](chrome-extension/) | Chrome extension that assists with grading exams in Blackboard Ultra's grading view |
-| [test/](test/) | A sample exam in GIFT format (`test_exam.gift`) |
+| [test/](test/) | A sample exam in both formats (`test_exam.gift`, `test_exam.zip`) |
 
 ## The converters
 

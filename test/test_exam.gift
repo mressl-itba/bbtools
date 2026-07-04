@@ -1,31 +1,30 @@
 // Convertido de QTI 2.1 (Blackboard Ultra) a Moodle GIFT
 // test: Prueba
 
-::QUE__1261215_1::¿Cómo es esto?{
+::QUE__1261215_1::¿2 + 2 \= 4?{
 T
 }
 
-::QUE__1261214_1::¿Qué hicimos ayer?{
-=Turismo
-~Ferretería
-~Anclaje
-~Saltimbanqui
+::QUE__1261214_1::¿Cuál es el día más bello?{
+=Hoy
+~Ayer
+~Mañana
+~Pasado mañana
 }
 
-::QUE__1261213_1::¿Qué hacemos mañana?
-y \= sin ( x ){
-~%50%Vamos a comer
-~%50%Vamos a beber
-~%-50%Vamos a caminar
-~%-50%Vamos a saltar
+::QUE__1261213_1::¿Cuál es la cosa más fácil?{
+~%50%Equivocarse
+~%50%Cometer errores
+~%-50%Asombrarse
+~%-50%Sonreir
 }
 
-::QUE__1261212_1::¿Cuál es el día más bello?{
-~%50%Hoy
-~%50%Mañana
-~%-50%Ayer
-~%-50%Pasado-mañana
+::QUE__1261212_1::¿Cuál es el obstáculo más grande?{
+~%50%El miedo
+~%50%El orgullo
+~%-50%El ego
+~%-50%La ignorancia
 ####Comentarios de respuesta incorrecta van aquí
 }
 
-::QUE__1261211_1::Cuál es el día más lindo?{}
+::QUE__1261211_1::¿Cuál es el mayor error?{}
