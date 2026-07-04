@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "BB Ultra - Assisted grading (ITBA)",
+  "version": "0.1.0",
+  "description": "Export and import exam grades/comments in Blackboard Ultra by simulating real user interaction. Does not use the internal REST API.",
+  "permissions": ["downloads"],
+  "host_permissions": ["https://campus.itba.edu.ar/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://campus.itba.edu.ar/*"],
+      "js": ["content.js"],
+      "css": ["panel.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}
